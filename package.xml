@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>hand_obstacle_tracker</name>
+  <version>0.1.0</version>
+  <description>
+    Алгоритм 5.1: трекинг руки человека камерой Intel RealSense (YOLOv8-pose),
+    построение капсулы-препятствия и публикация её в MoveIt2 как CollisionObject.
+    Проект "Динамический учёт препятствий в рабочей зоне iiwa".
+  </description>
+  <maintainer email="vzgladovzahar@gmail.com">Взглядов З. Е.</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>shape_msgs</exec_depend>
+  <exec_depend>moveit_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
+  <exec_depend>message_filters</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Веса моделей YOLO (качаются автоматически, в репозиторий не кладём)
+*.pt
+*.onnx
+*.engine
+
+# ROS 2 workspace (если репозиторий = корень workspace)
+build/
+install/
+log/
+
+# IDE / ОС
+.vscode/
+.idea/
+*.swp
+.DS_Store
