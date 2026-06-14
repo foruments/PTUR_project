@@ -1,0 +1,30 @@
+hand_tracker_node:
+  ros__parameters:
+    # --- Топики камеры (realsense-ros, Jazzy, namespace по умолчанию /camera/camera) ---
+    color_topic: "/camera/camera/color/image_raw"
+    depth_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+    camera_info_topic: "/camera/camera/color/camera_info"
+
+    # --- Системы координат ---
+    # ВАЖНО: имена кадров зависят от настройки realsense-ros и URDF iiwa.
+    # Проверьте реальные имена командой:  ros2 run tf2_tools view_frames
+    camera_optical_frame: "camera_color_optical_frame"
+    base_frame: "link_0"            # базовый кадр iiwa (в lbr_fri_ros2_stack может быть "lbr_link_0")
+
+    # --- YOLOv8-pose ---
+    model_path: "yolov8n-pose.pt"   # n/s/m — компромисс скорость/точность
+    device: "cpu"                   # "cpu" или "cuda:0" при наличии GPU
+    kp_conf_threshold: 0.5
+
+    # --- Глубина ---
+    depth_scale: 0.001              # RealSense: uint16 мм -> метры
+    depth_window: 5                 # окно медианной фильтрации глубины, px
+
+    # --- Геометрия капсулы ---
+    arm_radius: 0.06                # радиус руки, м
+    safety_margin: 0.05             # защитный зазор, м
+    forearm_length: 0.25            # длина предплечья для экстраполяции при окклюзии, м
+
+    # --- Прочее ---
+    object_id: "human_arm"
+    workzone_center: [0.0, 0.0, 0.0]  # точка отсчёта "близости к роботу" (в base_frame)
