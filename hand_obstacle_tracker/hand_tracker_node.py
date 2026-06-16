@@ -1,34 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Алгоритм 5.1 — обработка данных камеры.
-
-Нода: принимает цветной кадр + выровненную глубину с Intel RealSense
-(realsense-ros, ROS 2 Jazzy), запускает YOLOv8-pose, выбирает "рабочую" руку,
-обрабатывает окклюзию кисти, переводит пиксели+глубину в 3D и по TF2 в базу
-робота, строит капсулу (цилиндр + 2 сферы) и публикует её в MoveIt2 как
-CollisionObject (PlanningScene, is_diff=True), а также как Marker для RViz.
-
-Чистая математика — в модуле geometry.py (покрыта юнит-тестами).
-"""
 import numpy as np
-
+import time  # <--- ДОБАВЛЕНО для замеров времени
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-
 import message_filters
 from cv_bridge import CvBridge
-
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PointStamped, Pose
 from shape_msgs.msg import SolidPrimitive
 from moveit_msgs.msg import CollisionObject, PlanningScene
 from visualization_msgs.msg import Marker, MarkerArray
-
 import tf2_ros
 from tf2_geometry_msgs import do_transform_point
-
 from .geometry import (deproject_pixel, extrapolate_wrist,
                        capsule_geometry, select_nearest)
 
@@ -39,11 +24,10 @@ KP = {
     "left_wrist": 9,    "right_wrist": 10,
 }
 
-
 class HandTrackerNode(Node):
     def __init__(self):
         super().__init__("hand_tracker_node")
-
+        
         # ---------- Параметры ----------
         self.declare_parameter("color_topic", "/camera/camera/color/image_raw")
         self.declare_parameter("depth_topic", "/camera/camera/aligned_depth_to_color/image_raw")
@@ -53,7 +37,7 @@ class HandTrackerNode(Node):
         self.declare_parameter("model_path", "yolov8n-pose.pt")
         self.declare_parameter("device", "cpu")
         self.declare_parameter("kp_conf_threshold", 0.5)
-        self.declare_parameter("depth_scale", 0.001)      # uint16 мм -> метры
+        self.declare_parameter("depth_scale", 0.001)      
         self.declare_parameter("depth_window", 5)
         self.declare_parameter("arm_radius", 0.06)
         self.declare_parameter("safety_margin", 0.05)
@@ -73,76 +57,127 @@ class HandTrackerNode(Node):
         self.object_id = g("object_id").value
         self.workzone_center = np.array(g("workzone_center").value, dtype=float)
 
+        # ---------- ЛОГИ: Проверяем топики ----------
+        self.get_logger().info("="*40)
+        self.get_logger().info("🔍 Настройка подписок:")
+        self.get_logger().info(f"   Color Topic : {g('color_topic').value}")
+        self.get_logger().info(f"   Depth Topic : {g('depth_topic').value}")
+        self.get_logger().info(f"   Info Topic  : {g('camera_info_topic').value}")
+        self.get_logger().info(f"   Base Frame  : {self.base_frame}")
+        self.get_logger().info("="*40)
+
         # ---------- YOLO ----------
         try:
             from ultralytics import YOLO
         except ImportError:
-            self.get_logger().fatal(
-                "Не найден пакет ultralytics. Установите: pip3 install ultralytics")
+            self.get_logger().fatal("Не найден пакет ultralytics. Установите: pip3 install ultralytics")
             raise
         self.model = YOLO(g("model_path").value)
         self.device = g("device").value
-        self.get_logger().info(f"YOLOv8-pose загружена: {g('model_path').value} ({self.device})")
+        self.get_logger().info(f"🧠 YOLOv8-pose загружена: {g('model_path').value} (Устройство: {self.device})")
 
         # ---------- Вспомогательное ----------
         self.bridge = CvBridge()
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.intr = None             # (fx, fy, cx, cy) — кэш интринсик
+        self.intr = None             
         self._object_present = False
+        
+        # Счетчики для отладки
+        self.color_count = 0
+        self.depth_count = 0
+        self.sync_count = 0
+        self.sync_count_2sec = 0
+        self.last_log_time = time.time()
 
         # ---------- Издатели ----------
         self.scene_pub = self.create_publisher(PlanningScene, "/planning_scene", 10)
         self.marker_pub = self.create_publisher(MarkerArray, "~/debug_markers", 10)
 
         # ---------- Подписки ----------
-        # camera_info кэшируем отдельно (sensor_data QoS совместим и с reliable,
-        # и с best_effort издателем — частая причина "нет данных" при mismatch).
         self.create_subscription(CameraInfo, g("camera_info_topic").value,
                                  self.on_camera_info, qos_profile_sensor_data)
+                                 
+        # Отдельные подписки для подсчета входящих кадров (ДЛЯ ОТЛАДКИ)
+        self.create_subscription(Image, g("color_topic").value, self.cb_color, qos_profile_sensor_data)
+        self.create_subscription(Image, g("depth_topic").value, self.cb_depth, qos_profile_sensor_data)
+
         color_sub = message_filters.Subscriber(self, Image, g("color_topic").value,
-                                                qos_profile=qos_profile_sensor_data)
+                                               qos_profile=qos_profile_sensor_data)
         depth_sub = message_filters.Subscriber(self, Image, g("depth_topic").value,
                                                qos_profile=qos_profile_sensor_data)
+                                               
+        # ВНИМАНИЕ: slop увеличен с 0.05 до 0.1. В VirtualBox задержки USB часто 
+        # рассинхронизируют таймштампы, и 0.05 было слишком жестким условием.
         self.sync = message_filters.ApproximateTimeSynchronizer(
-            [color_sub, depth_sub], queue_size=10, slop=0.05)
+            [color_sub, depth_sub], queue_size=10, slop=0.1)
         self.sync.registerCallback(self.on_frames)
+        
+        self.get_logger().info("✅ hand_tracker_node запущена, ожидаю кадры…")
 
-        self.get_logger().info("hand_tracker_node запущена, ожидаю кадры…")
+    def cb_color(self, msg):
+        self.color_count += 1
 
-    # ----------------------------------------------------------------- #
+    def cb_depth(self, msg):
+        self.depth_count += 1
+
     def on_camera_info(self, msg: CameraInfo):
         fx, fy, cx, cy = msg.k[0], msg.k[4], msg.k[2], msg.k[5]
         if fx <= 0.0 or fy <= 0.0:
-            self.get_logger().warn("camera_info: некорректные интринсики (fx/fy = 0)",
-                                   throttle_duration_sec=5.0)
+            self.get_logger().warn("camera_info: некорректные интринсики (fx/fy = 0)", throttle_duration_sec=5.0)
             return
+        if self.intr is None:
+            self.get_logger().info(f"📷 camera_info получен! Интринсики: fx={fx:.1f}, fy={fy:.1f}")
         self.intr = (fx, fy, cx, cy)
 
-    # ----------------------------------------------------------------- #
     def on_frames(self, color_msg: Image, depth_msg: Image):
+        self.sync_count += 1
+        self.sync_count_2sec += 1
+        current_time = time.time()
+        
+        # Каждые 2 секунды выводим статистику
+        if current_time - self.last_log_time >= 2.0:
+            self.get_logger().info(f"📥 Статистика за 2 сек | Входящие: Color={self.color_count}, Depth={self.depth_count} | Синхронизировано (YOLO): {self.sync_count_2sec}")
+            self.color_count = 0
+            self.depth_count = 0
+            self.sync_count_2sec = 0
+            self.last_log_time = current_time
+
         if self.intr is None:
-            self.get_logger().warn("Жду camera_info…", throttle_duration_sec=5.0)
+            self.get_logger().warn("⏳ Жду camera_info…", throttle_duration_sec=5.0)
             return
+
         try:
             color = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding="bgr8")
             depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
         except Exception as e:
-            self.get_logger().warn(f"cv_bridge: {e}", throttle_duration_sec=2.0)
+            self.get_logger().warn(f"cv_bridge ошибка: {e}", throttle_duration_sec=2.0)
             return
 
-        # Глубина: 16UC1 -> мм (умножаем на depth_scale); 32FC1 -> уже метры
         depth_unit = 1.0 if depth_msg.encoding == "32FC1" else self.depth_scale
         stamp = color_msg.header.stamp
-
+        
+        start_infer = time.time()
         results = self.model.predict(color, device=self.device, verbose=False)
+        infer_time = time.time() - start_infer
+        
+        if self.sync_count % 15 == 0:
+            self.get_logger().info(f"⏱️ YOLO инференс занял: {infer_time*1000:.0f} мс")
+
         if not results:
             self.clear_object(stamp)
             return
+
         kpts = results[0].keypoints
         if kpts is None or kpts.xy is None or len(kpts.xy) == 0:
+            if self.sync_count % 15 == 0:
+                self.get_logger().info("👤 YOLO: люди в кадре не найдены")
             self.clear_object(stamp)
             return
+
+        num_people = len(kpts.xy)
+        if self.sync_count % 15 == 0:
+            self.get_logger().info(f"👤 YOLO: найдено людей в кадре: {num_people}")
 
         xy = kpts.xy.cpu().numpy()
         conf = (kpts.conf.cpu().numpy() if kpts.conf is not None
@@ -168,16 +203,13 @@ class HandTrackerNode(Node):
         i_sh, i_el, i_wr = KP[f"{side}_shoulder"], KP[f"{side}_elbow"], KP[f"{side}_wrist"]
         if person_conf[i_el] < self.kp_conf_th:
             return None
-
         elbow_cam = self.pixel_to_camera(person_xy[i_el], depth, depth_unit)
         if elbow_cam is None:
             return None
-
         wrist_visible = person_conf[i_wr] >= self.kp_conf_th
         wrist_cam = (self.pixel_to_camera(person_xy[i_wr], depth, depth_unit)
                      if wrist_visible else None)
-
-        if wrist_cam is None:  # окклюзия кисти -> экстраполяция от локтя
+        if wrist_cam is None:  
             if person_conf[i_sh] < self.kp_conf_th:
                 return None
             shoulder_cam = self.pixel_to_camera(person_xy[i_sh], depth, depth_unit)
@@ -186,7 +218,6 @@ class HandTrackerNode(Node):
             wrist_cam = extrapolate_wrist(elbow_cam, shoulder_cam, self.forearm_length)
             if wrist_cam is None:
                 return None
-
         elbow_b = self.to_base(elbow_cam, stamp)
         wrist_b = self.to_base(wrist_cam, stamp)
         if elbow_b is None or wrist_b is None:
@@ -237,13 +268,11 @@ class HandTrackerNode(Node):
     def publish_capsule(self, elbow, wrist, stamp):
         radius = self.arm_radius + self.safety_margin
         mid, height, (qx, qy, qz, qw) = capsule_geometry(elbow, wrist)
-
         obj = CollisionObject()
         obj.header.frame_id = self.base_frame
         obj.header.stamp = stamp
         obj.id = self.object_id
         obj.operation = CollisionObject.ADD
-
         if height > 1e-3:
             cyl = SolidPrimitive()
             cyl.type = SolidPrimitive.CYLINDER
@@ -253,7 +282,6 @@ class HandTrackerNode(Node):
             cp.orientation.x, cp.orientation.y, cp.orientation.z, cp.orientation.w = qx, qy, qz, qw
             obj.primitives.append(cyl)
             obj.primitive_poses.append(cp)
-
         for end in (elbow, wrist):
             sph = SolidPrimitive()
             sph.type = SolidPrimitive.SPHERE
@@ -263,7 +291,6 @@ class HandTrackerNode(Node):
             sp.orientation.w = 1.0
             obj.primitives.append(sph)
             obj.primitive_poses.append(sp)
-
         scene = PlanningScene()
         scene.is_diff = True
         scene.world.collision_objects.append(obj)
@@ -313,7 +340,6 @@ class HandTrackerNode(Node):
             arr.markers.append(s)
         self.marker_pub.publish(arr)
 
-
 def main(args=None):
     rclpy.init(args=args)
     node = HandTrackerNode()
@@ -324,7 +350,6 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()
